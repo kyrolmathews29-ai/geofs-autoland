@@ -1,0 +1,420 @@
+(function() {
+    'use strict';
+    console.log(">>> GEOFS ULTIMATE MOD: LOADED <<<");
+
+    // ==========================================
+    // 1. CONFIGURATION & DATABASE
+    // ==========================================
+    const AC_DB = {
+        CLASSIC: ["757", "767", "737-300", "737-400", "737-500"], // Round PFD + RB211
+        MODERN: ["787", "777", "a350", "c919", "a220", "embraer", "e170", "e190"], // Glass PFD
+        T_TAIL: ["md-80", "md-88", "crj", "learjet", "c-17", "erj"], // Deep Stall Risk
+        MD11: ["md-11", "dc-10"], // LSAS Stability
+        AIRBUS: ["a320", "a321", "a319", "a330", "a340", "a380"] // Alpha Floor
+    };
+
+    let settings = {
+        mode: "NONE", // CLASSIC, MODERN
+        pfdVisible: true,
+        physicsEnabled: true,
+        soundEnabled: true,
+        wakeTurbulence: true,
+        windshear: true,
+        autoland: false,
+        gearSound: true
+    };
+
+    let state = {
+        deepStall: false,
+        lsasPitch: null,
+        lastGear: 0,
+        loop: null
+    };
+
+    // ==========================================
+    // 2. USER INTERFACE (Customizable Menu)
+    // ==========================================
+    function createUI() {
+        // Cleanup old
+        if (document.getElementById("gmod_menu")) document.getElementById("gmod_menu").remove();
+        if (document.getElementById("gmod_overlay")) document.getElementById("gmod_overlay").remove();
+
+        // --- MAIN MENU (Draggable-ish via absolute pos) ---
+        let menu = document.createElement("div");
+        menu.id = "gmod_menu";
+        menu.style.cssText = `
+            position: absolute; top: 10px; left: 10px; width: 250px;
+            background: rgba(0,0,0,0.9); border: 2px solid red; color: white;
+            font-family: Consolas, monospace; font-size: 12px; padding: 10px;
+            z-index: 100000; box-shadow: 0 0 15px #000;
+        `;
+        menu.innerHTML = `
+            <div style="font-weight:bold; color:red; border-bottom:1px solid #555; margin-bottom:10px;">
+                ULTIMATE SYSTEMS MOD
+            </div>
+            
+            <div style="margin-bottom:5px; color:yellow;">AIRCRAFT DETECTED: <span id="gm_ac_name" style="color:white;">Scanning...</span></div>
+            
+            <div style="background:#222; padding:5px; margin-bottom:5px;">
+                <strong>FORCE SYSTEM:</strong><br>
+                <button id="btn_set_classic" style="width:48%; background:#444; color:lime; border:1px solid #555; cursor:pointer;">757 CLASSIC</button>
+                <button id="btn_set_modern" style="width:48%; background:#444; color:cyan; border:1px solid #555; cursor:pointer;">MODERN GLASS</button>
+            </div>
+
+            <div style="background:#222; padding:5px;">
+                <strong>TOGGLES:</strong><br>
+                <label><input type="checkbox" id="chk_pfd" checked> Overlay PFD</label><br>
+                <label><input type="checkbox" id="chk_phys" checked> Advanced Physics</label><br>
+                <label><input type="checkbox" id="chk_snds" checked> Engine Sounds</label><br>
+                <label><input type="checkbox" id="chk_wake" checked> Wake Turbulence</label><br>
+                <label><input type="checkbox" id="chk_shear" checked> Windshear</label>
+            </div>
+
+            <div style="margin-top:10px;">
+                <button id="btn_autoland" style="width:100%; background:darkred; color:white; font-weight:bold; border:2px solid white; padding:5px; cursor:pointer;">AUTOLAND: OFF</button>
+            </div>
+            
+            <div id="gm_alerts" style="margin-top:10px; color:red; font-weight:bold; text-align:center; height:20px;"></div>
+        `;
+        document.body.appendChild(menu);
+
+        // Events
+        document.getElementById("btn_set_classic").onclick = () => setSystem("CLASSIC");
+        document.getElementById("btn_set_modern").onclick = () => setSystem("MODERN");
+        
+        document.getElementById("chk_pfd").onchange = (e) => { 
+            settings.pfdVisible = e.target.checked; 
+            document.getElementById("gmod_overlay").style.display = settings.pfdVisible ? "flex" : "none";
+        };
+        document.getElementById("chk_phys").onchange = (e) => settings.physicsEnabled = e.target.checked;
+        document.getElementById("chk_snds").onchange = (e) => settings.soundEnabled = e.target.checked;
+        document.getElementById("chk_wake").onchange = (e) => settings.wakeTurbulence = e.target.checked;
+        document.getElementById("chk_shear").onchange = (e) => settings.windshear = e.target.checked;
+
+        document.getElementById("btn_autoland").onclick = function() {
+            settings.autoland = !settings.autoland;
+            this.style.background = settings.autoland ? "lime" : "darkred";
+            this.style.color = settings.autoland ? "black" : "white";
+            this.innerText = settings.autoland ? "AUTOLAND: ARMED" : "AUTOLAND: OFF";
+        };
+
+        // --- INSTRUMENT OVERLAY (The "Black Tape" Look) ---
+        let overlay = document.createElement("div");
+        overlay.id = "gmod_overlay";
+        overlay.style.cssText = `
+            position: absolute; bottom: 20px; left: 20px; display: flex; align-items: flex-end;
+            pointer-events: none; z-index: 9000; gap: 20px;
+        `;
+        
+        // PFD Canvas
+        let cvs = document.createElement("canvas");
+        cvs.id = "gm_pfd";
+        cvs.width = 260; cvs.height = 260;
+        // Default hidden until mode selected
+        cvs.style.display = "none";
+        overlay.appendChild(cvs);
+
+        // EICAS / INFO Panel
+        let info = document.createElement("div");
+        info.id = "gm_info";
+        info.style.cssText = `
+            width: 140px; height: 200px; background: black; border: 3px solid #444;
+            color: lime; font-family: monospace; padding: 5px; font-size: 12px;
+            display: none; flex-direction: column; justify-content: space-between;
+        `;
+        info.innerHTML = `
+            <div style="text-align:center; border-bottom:1px solid #555; color:cyan;">SYSTEMS</div>
+            <div>
+                N1: <span id="val_n1">0</span>%<br>
+                <div style="width:100%; height:5px; background:#333;"><div id="bar_n1" style="width:0%; height:100%; background:lime;"></div></div>
+            </div>
+            <div>
+                EGT: <span id="val_egt">0</span>c<br>
+                <div style="width:100%; height:5px; background:#333;"><div id="bar_egt" style="width:0%; height:100%; background:orange;"></div></div>
+            </div>
+            <div>
+                SQ: <input type="text" value="2200" style="width:50px; background:black; border:1px solid gray; color:orange; pointer-events:auto;">
+            </div>
+        `;
+        overlay.appendChild(info);
+
+        document.body.appendChild(overlay);
+    }
+
+    // ==========================================
+    // 3. SYSTEM LOGIC
+    // ==========================================
+    function setSystem(mode) {
+        settings.mode = mode;
+        let cvs = document.getElementById("gm_pfd");
+        let info = document.getElementById("gm_info");
+        let acName = geofs.aircraft.instance.definition.name;
+
+        document.getElementById("gm_ac_name").innerText = acName;
+
+        if (mode === "CLASSIC") {
+            // Round PFD Style
+            cvs.style.display = "block";
+            cvs.style.borderRadius = "50%";
+            cvs.style.border = "6px solid #333";
+            cvs.style.background = "#1a1a1a";
+            info.style.display = "flex";
+            applySounds(); // RB211
+        } else if (mode === "MODERN") {
+            // Square Glass Style
+            cvs.style.display = "block";
+            cvs.style.borderRadius = "15px";
+            cvs.style.border = "4px solid #555";
+            cvs.style.background = "black"; // Black tape look
+            info.style.display = "flex";
+        }
+        
+        // Hide default glass cockpit if possible
+        if(geofs.aircraft.instance.object3d) {
+            geofs.aircraft.instance.object3d.traverse(child => {
+                if(child.name && (child.name.includes("screen") || child.name.includes("display"))) {
+                    child.visible = false;
+                }
+            });
+        }
+    }
+
+    // ==========================================
+    // 4. PHYSICS ENGINE (The Core Loop)
+    // ==========================================
+    function runPhysics() {
+        if (!settings.physicsEnabled) return;
+        
+        let p = geofs.animation.values.pitch;
+        let r = geofs.animation.values.roll;
+        let s = geofs.animation.values.kias;
+        let vs = geofs.animation.values.verticalSpeed;
+        let alt = geofs.animation.values.altitude;
+        let name = geofs.aircraft.instance.definition.name.toLowerCase();
+
+        // --- A. DEEP STALL (T-Tail) ---
+        let isTTail = AC_DB.T_TAIL.some(x => name.includes(x));
+        if (isTTail) {
+            if (p > 22 && s < 110 && vs < -500) {
+                state.deepStall = true;
+                geofs.api.controls.pitch = 0; // Elevator masking
+                alertMsg("DEEP STALL");
+            } else {
+                state.deepStall = false;
+            }
+        }
+
+        // --- B. LSAS (MD-11) ---
+        let isMD11 = AC_DB.MD11.some(x => name.includes(x));
+        if (isMD11) {
+            let input = geofs.api.controls.pitch;
+            if (Math.abs(input) < 0.05) {
+                if (state.lsasPitch === null) state.lsasPitch = p;
+                let error = state.lsasPitch - p;
+                geofs.aircraft.instance.rigidBody.applyTorqueImpulse([error * 6000, 0, 0]);
+            } else {
+                state.lsasPitch = null;
+            }
+        }
+
+        // --- C. AIRBUS PROTECTIONS ---
+        let isAirbus = AC_DB.AIRBUS.some(x => name.includes(x)) || name.includes("a350");
+        if (isAirbus) {
+            // Alpha Floor
+            if (s < 120 && p > 12) {
+                alertMsg("ALPHA FLOOR");
+                geofs.api.controls.throttle = 1; // TOGA
+            }
+            // Bank Limit
+            if (r > 67) geofs.api.controls.roll = -0.5;
+            if (r < -67) geofs.api.controls.roll = 0.5;
+        }
+
+        // --- D. 757/767 TAIL STRIKE ---
+        if (settings.mode === "CLASSIC" && p > 9.5 && alt < 10) {
+            alertMsg("TAIL STRIKE RISK");
+        }
+
+        // --- E. WAKE TURBULENCE ---
+        if (settings.wakeTurbulence && geofs.api.multiplayer?.users) {
+            let myPos = geofs.aircraft.instance.llaLocation;
+            for (let u in geofs.api.multiplayer.users) {
+                let user = geofs.api.multiplayer.users[u];
+                let dist = Math.sqrt(Math.pow(user.coor[0]-myPos[0],2) + Math.pow(user.coor[1]-myPos[1],2));
+                if (dist < 0.005 && dist > 0.0001) {
+                    geofs.camera.cam.rotation.z += (Math.random()-0.5) * 0.015; // Camera shake
+                    geofs.aircraft.instance.rigidBody.applyTorqueImpulse([0, (Math.random()-0.5)*1000, 0]); // Physics roll
+                }
+            }
+        }
+
+        // --- F. WINDSHEAR ---
+        if (settings.windshear && geofs.weather && geofs.weather.currentWindSpeed > 15) {
+            if (Math.random() > 0.999) {
+                alertMsg("WINDSHEAR");
+                geofs.aircraft.instance.rigidBody.applyCentralImpulse([0,0,-50000]); // Downburst
+            }
+        }
+
+        // --- G. AUTOLAND ---
+        if (settings.autoland) {
+            if (alt > 40) {
+                geofs.autopilot.setMode("hdg");
+                geofs.autopilot.values.verticalSpeed = -700;
+                if(!geofs.autopilot.on) geofs.autopilot.turnOn();
+            } else {
+                geofs.autopilot.values.verticalSpeed = -50; // Flare
+                geofs.api.controls.throttle = 0;
+            }
+        }
+        
+        // --- H. GEAR CLUNK ---
+        if (settings.gearSound) {
+            let g = geofs.animation.values.gearPosition;
+            if (g > 0.05 && g < 0.95 && Math.random() > 0.9) {
+                geofs.camera.cam.position.y -= 0.02; // Clunk
+                setTimeout(() => geofs.camera.cam.position.y += 0.02, 50);
+            }
+        }
+    }
+
+    function alertMsg(txt) {
+        let el = document.getElementById("gm_alerts");
+        el.innerText = txt;
+        setTimeout(() => { if(el.innerText===txt) el.innerText=""; }, 1000);
+    }
+
+    // ==========================================
+    // 5. GRAPHICS ENGINE (The PFDs)
+    // ==========================================
+    function drawPFD() {
+        if (!settings.pfdVisible) return;
+        let cvs = document.getElementById("gm_pfd");
+        if (!cvs || cvs.style.display === "none") return;
+        
+        let ctx = cvs.getContext("2d");
+        let w = cvs.width, h = cvs.height;
+        let p = geofs.animation.values.pitch;
+        let r = geofs.animation.values.roll;
+        let s = geofs.animation.values.kias;
+        let alt = geofs.animation.values.altitude;
+
+        ctx.clearRect(0,0,w,h);
+
+        // --- SETUP CLIP ---
+        ctx.save();
+        ctx.translate(w/2, h/2);
+        ctx.beginPath();
+        if (settings.mode === "CLASSIC") ctx.arc(0,0, w/2 - 10, 0, Math.PI*2);
+        else ctx.rect(-w/2, -h/2, w, h);
+        ctx.clip();
+
+        // --- ARTIFICIAL HORIZON ---
+        ctx.rotate(-r * Math.PI / 180);
+        ctx.translate(0, p * 4); // Pitch sensitivity
+
+        // Colors
+        let colSky = settings.mode === "CLASSIC" ? "#3e9ec0" : "#003366";
+        let colGnd = settings.mode === "CLASSIC" ? "#8b572a" : "#4d2600";
+
+        ctx.fillStyle = colSky; ctx.fillRect(-200, -400, 400, 400);
+        ctx.fillStyle = colGnd; ctx.fillRect(-200, 0, 400, 400);
+        ctx.strokeStyle = "white"; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(-200,0); ctx.lineTo(200,0); ctx.stroke();
+        
+        ctx.restore();
+
+        // --- OVERLAYS ---
+        // Aircraft Symbol
+        ctx.strokeStyle = settings.mode === "CLASSIC" ? "yellow" : "black";
+        ctx.lineWidth = 4;
+        ctx.beginPath(); 
+        ctx.moveTo(w/2 - 50, h/2); ctx.lineTo(w/2 - 10, h/2);
+        ctx.moveTo(w/2 + 10, h/2); ctx.lineTo(w/2 + 50, h/2);
+        if (settings.mode === "CLASSIC") {
+            ctx.moveTo(w/2, h/2); ctx.lineTo(w/2, h/2); // Dot
+        }
+        ctx.stroke();
+        if (settings.mode === "MODERN") {
+            ctx.strokeStyle = "#fc0"; ctx.lineWidth=2; ctx.stroke();
+        }
+
+        // --- SPEED TAPE (Black Tape Look) ---
+        ctx.fillStyle = "rgba(0,0,0,0.8)";
+        ctx.fillRect(0, h/2 - 20, 60, 40);
+        ctx.fillStyle = "lime"; ctx.font = "bold 20px monospace";
+        ctx.fillText(Math.round(s), 10, h/2 + 7);
+        
+        // --- ALTITUDE TAPE ---
+        if (settings.mode === "MODERN") {
+            ctx.fillStyle = "rgba(0,0,0,0.8)";
+            ctx.fillRect(w-80, h/2 - 20, 80, 40);
+            ctx.textAlign = "right";
+            ctx.fillStyle = "lime";
+            ctx.fillText(Math.round(alt), w-10, h/2 + 7);
+            
+            // Radio Alt
+            if(alt < 2500) {
+                ctx.textAlign = "center";
+                ctx.fillStyle = alt<500 ? "orange" : "white";
+                ctx.font = "bold 24px Arial";
+                ctx.fillText(Math.round(alt), w/2, h - 30);
+                ctx.font = "10px Arial"; ctx.fillStyle = "lime";
+                ctx.fillText("RADIO", w/2, h - 55);
+            }
+            
+            // Flight Directors
+            ctx.strokeStyle = "magenta"; ctx.lineWidth = 3;
+            ctx.beginPath(); ctx.moveTo(w/2-40, h/2 - (p*4)); ctx.lineTo(w/2+40, h/2 - (p*4)); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(w/2+r, h/2-30); ctx.lineTo(w/2+r, h/2+30); ctx.stroke();
+        }
+
+        // --- UPDATE INFO PANEL ---
+        let rpm = geofs.animation.values.rpm;
+        let n1 = (rpm/100).toFixed(1);
+        document.getElementById("val_n1").innerText = n1;
+        document.getElementById("bar_n1").style.width = Math.min(n1, 100) + "%";
+        document.getElementById("val_egt").innerText = Math.round(n1*6);
+        document.getElementById("bar_egt").style.width = Math.min(n1, 100) + "%";
+    }
+
+    // ==========================================
+    // 6. SOUND ENGINE
+    // ==========================================
+    function applySounds() {
+        if (!settings.soundEnabled || !geofs.aircraft.instance.definition.sounds) return;
+        geofs.aircraft.instance.definition.sounds.forEach(s => {
+            if (s.id === "eng" || s.id === "turbine") {
+                s.pitch = {value: 1, ratio: 1.45}; // RB211 Whine
+            }
+        });
+        if (geofs.audio) geofs.audio.initAircraftAudio();
+    }
+
+    // ==========================================
+    // 7. INITIALIZATION
+    // ==========================================
+    function init() {
+        createUI();
+        
+        // Auto-Detect
+        let name = geofs.aircraft.instance.definition.name.toLowerCase();
+        if (AC_DB.CLASSIC.some(x => name.includes(x))) setSystem("CLASSIC");
+        else if (AC_DB.MODERN.some(x => name.includes(x))) setSystem("MODERN");
+        
+        // Start Loops
+        setInterval(() => {
+            runPhysics();
+            drawPFD();
+        }, 50);
+    }
+    
+    // Launch
+    let interval = setInterval(() => {
+        if (typeof geofs !== "undefined" && geofs.aircraft && geofs.aircraft.instance) {
+            clearInterval(interval);
+            init();
+        }
+    }, 1000);
+
+})();
